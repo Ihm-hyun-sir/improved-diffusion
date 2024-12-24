@@ -35,6 +35,7 @@ def main():
         batch_size=args.batch_size,
         image_size=args.image_size,
         class_cond=args.class_cond,
+        deterministic=True  # No shuffle
     )
 
     logger.log("training...")

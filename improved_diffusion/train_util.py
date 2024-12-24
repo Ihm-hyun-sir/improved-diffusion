@@ -185,23 +185,39 @@ class TrainLoop:
             self.optimize_normal()
         self.log_step()
 
+    #https://github.com/facebookresearch/mixup-cifar10/blob/main/train.py
+    def mixup_data(x, y, use_cuda=True):
+        '''Returns mixed inputs, pairs of targets, and lambda'''
+        lam = 0.9
+
+        batch_size = x.size()[0]
+        if use_cuda:
+            index = th.randperm(batch_size).cuda()
+        else:
+            index = th.randperm(batch_size)
+
+        mixed_x = lam * x + (1 - lam) * x[index, :]
+        y_a, y_b = y, y[index]
+        return mixed_x, y_a, y_b, lam
+
     def forward_backward(self, batch, cond):
         zero_grad(self.model_params)
         for i in range(0, batch.shape[0], self.microbatch):
-            micro = batch[i : i + self.microbatch].to(dist_util.dev())
+            micro = batch[i : i + self.microbatch].to(dist_util.dev()) # dist_util.dev => 현재 사용중인 device로 이동
             micro_cond = {
                 k: v[i : i + self.microbatch].to(dist_util.dev())
                 for k, v in cond.items()
             }
+            print("God damn micro cond!!!!!!!!!!:",micro_cond)
             last_batch = (i + self.microbatch) >= batch.shape[0]
             t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
 
             compute_losses = functools.partial(
                 self.diffusion.training_losses,
-                self.ddp_model,
-                micro,
-                t,
-                model_kwargs=micro_cond,
+                self.ddp_model, # model
+                micro, #x_start
+                t, # t
+                model_kwargs=micro_cond, #model_kwargs
             )
 
             if last_batch or not self.use_ddp:
