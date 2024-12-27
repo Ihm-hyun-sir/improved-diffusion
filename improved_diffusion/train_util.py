@@ -20,6 +20,8 @@ from .fp16_util import (
 from .nn import update_ema
 from .resample import LossAwareSampler, UniformSampler
 
+from tqdm import tqdm # tqdm import
+
 # For ImageNet experiments, this was a good default value.
 # We found that the lg_loss_scale quickly climbed to
 # 20-21 within the first ~1K steps of training.
@@ -33,6 +35,7 @@ class TrainLoop:
         model,
         diffusion,
         data,
+        data_len,  # 데이터 길이
         batch_size,
         microbatch,
         lr,
@@ -40,7 +43,9 @@ class TrainLoop:
         log_interval,
         save_interval,
         resume_checkpoint,
+        model_path, # 모델 저장 위치
         use_fp16=False,
+        epoch = 100, # Epoch 수
         fp16_scale_growth=1e-3,
         schedule_sampler=None,
         weight_decay=0.0,
@@ -49,6 +54,7 @@ class TrainLoop:
         self.model = model
         self.diffusion = diffusion
         self.data = data
+        self.data_len=data_len # 데이터 길이 설정
         self.batch_size = batch_size
         self.microbatch = microbatch if microbatch > 0 else batch_size
         self.lr = lr
@@ -60,11 +66,15 @@ class TrainLoop:
         self.log_interval = log_interval
         self.save_interval = save_interval
         self.resume_checkpoint = resume_checkpoint
+        self.model_path = model_path # 모델 저장 위치 설정
         self.use_fp16 = use_fp16
         self.fp16_scale_growth = fp16_scale_growth
         self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
+ 
+        self.epoch = epoch # Epoch 수 저장
+        self.steps_per_epoch = self.data_len//batch_size # Epoch 마다 총 step 수 (데이터 길이 // 배치 크기)
 
         self.step = 0
         self.resume_step = 0
@@ -159,23 +169,20 @@ class TrainLoop:
         self.model.convert_to_fp16()
 
     def run_loop(self):
-        while (
-            not self.lr_anneal_steps
-            or self.step + self.resume_step < self.lr_anneal_steps
-        ):
-            batch, cond = next(self.data)
-            self.run_step(batch, cond)
-            if self.step % self.log_interval == 0:
-                logger.dumpkvs()
-            if self.step % self.save_interval == 0:
-                self.save()
-                # Run for a finite amount of time in integration tests.
-                if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
-                    return
-            self.step += 1
-        # Save the last checkpoint if it wasn't already saved.
-        if (self.step - 1) % self.save_interval != 0:
-            self.save()
+        for epc in range(self.epoch): # 정해진 Epoch 만큼 학습
+            with tqdm(total=self.steps_per_epoch, desc=f"Epoch {epc + 1}/{self.epoch}", unit="step") as pbar: #tqdm으로 진행상황 출력
+                for _ in range(self.steps_per_epoch): # 1 Epoch - 전체 데이터를 배치 단위로 학습
+                    # 배치 단위 학습
+                    batch, cond = next(self.data)
+                    self.run_step(batch, cond)
+
+                    # 10회 step 마다 Loss 진행 상황 logging
+                    if self.step % self.log_interval == 0: 
+                        logger.dumpkvs()
+                    
+                    self.step += 1 # step 추가 (모델 저장 및 로깅에 쓰임)
+                    pbar.update(1) # tqdm 업데이트
+        self.save() # 모든 Epoch을 다 수행했다면 모델을 저장
 
     def run_step(self, batch, cond):
         self.forward_backward(batch, cond)
@@ -193,9 +200,10 @@ class TrainLoop:
                 k: v[i : i + self.microbatch].to(dist_util.dev())
                 for k, v in cond.items()
             }
+
             last_batch = (i + self.microbatch) >= batch.shape[0]
             t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
-
+            
             compute_losses = functools.partial(
                 self.diffusion.training_losses,
                 self.ddp_model,
@@ -274,10 +282,10 @@ class TrainLoop:
             if dist.get_rank() == 0:
                 logger.log(f"saving model {rate}...")
                 if not rate:
-                    filename = f"model{(self.step+self.resume_step):06d}.pt"
+                    filename = f"model{(self.step+self.resume_step):06d}.pt" # 일반 모델
                 else:
-                    filename = f"ema_{rate}_{(self.step+self.resume_step):06d}.pt"
-                with bf.BlobFile(bf.join(get_blob_logdir(), filename), "wb") as f:
+                    filename = f"ema_{rate}_{(self.step+self.resume_step):06d}.pt" # EMA 모델을 쓰면 조금 더 효율적으로 샘플링 가능
+                with bf.BlobFile(bf.join(self.model_path, filename), "wb") as f: # 모델 저장 위치에 현재 모델 상태 저장 (model_XXXX.pt, ema_0.9999_XXXX.pt) 
                     th.save(state_dict, f)
 
         save_checkpoint(0, self.master_params)
@@ -286,7 +294,7 @@ class TrainLoop:
 
         if dist.get_rank() == 0:
             with bf.BlobFile(
-                bf.join(get_blob_logdir(), f"opt{(self.step+self.resume_step):06d}.pt"),
+                bf.join(self.model_path, f"opt{(self.step+self.resume_step):06d}.pt"), # 모델 저장 위치에 현재 Optimizer 상태 저장
                 "wb",
             ) as f:
                 th.save(self.opt.state_dict(), f)

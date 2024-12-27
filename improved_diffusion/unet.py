@@ -314,6 +314,7 @@ class UNetModel(nn.Module):
         num_heads=1,
         num_heads_upsample=-1,
         use_scale_shift_norm=False,
+        use_soft_labeling=False, # Soft Labeling 사용 여부
     ):
         super().__init__()
 
@@ -332,7 +333,7 @@ class UNetModel(nn.Module):
         self.use_checkpoint = use_checkpoint
         self.num_heads = num_heads
         self.num_heads_upsample = num_heads_upsample
-
+        self.use_soft_labeling = use_soft_labeling # Soft Labeling 사용 여부 설정
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
             linear(model_channels, time_embed_dim),
@@ -459,6 +460,32 @@ class UNetModel(nn.Module):
         """
         return next(self.input_blocks.parameters()).dtype
 
+#############################################################################
+    def soft_label_emb(self, y, smoothing = 0.2, num_classes=10):
+        """
+        주어진 y를 Soft Labeling을 적용한 Embedding으로 변환
+
+        :y: 주어진 라벨(클래스) Index (Batch x 1)
+        :smoothing: smoothing 하고 싶은 정도
+        :num_classes: 클래스 수
+        """
+        batch_size = y.size(0) # 배치 크기
+        
+        # 라벨(클래스) Index를 One hot Encoding + Soft Label 형태로 변환 (Batch x Number of Classes)
+        # EX) [1,2] -> [[0.022,0.8,0.022,0.022,0.022,0.022,0.022,0.022,0.022,0.022],[0.022,0.022,0.8,0.022,0.022,0.022,0.022,0.022,0.022,0.022]]
+        smooth_value = smoothing / (num_classes - 1)
+        one_hot = th.full((batch_size, num_classes), smooth_value).to(y.device)
+        one_hot.scatter_(1, y.unsqueeze(1), 1.0 - smoothing)
+
+        # 각 라벨(클래스) Index (0~9)를 Embedding (Number of Classes x Embedding Dimension)
+        class_embeddings = self.label_emb(th.arange(num_classes).to(y.device))
+
+        # Soft Label을 가중치로 하여, 위에서 구한 각 Embedding의 가중합을 최종 embedding으로 사용 (Batch x Embedding Dimension)
+        embeddings = th.matmul(one_hot, class_embeddings)
+
+        return embeddings
+#############################################################################
+
     def forward(self, x, timesteps, y=None):
         """
         Apply the model to an input batch.
@@ -477,7 +504,10 @@ class UNetModel(nn.Module):
 
         if self.num_classes is not None:
             assert y.shape == (x.shape[0],)
-            emb = emb + self.label_emb(y)
+            if self.use_soft_labeling: # 만약 Soft Labeling을 진행한다면 soft_label_emb 사용
+                emb = emb + self.soft_label_emb(y)
+            else: # 그렇지 않다면 일반 label_emb 사용
+                emb = emb + self.label_emb(y) 
 
         h = x.type(self.inner_dtype)
         for module in self.input_blocks:
