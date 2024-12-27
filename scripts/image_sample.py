@@ -42,10 +42,16 @@ def main():
     while len(all_images) * args.batch_size < args.num_samples:
         model_kwargs = {}
         if args.class_cond:
-            classes = th.randint(
-                low=0, high=NUM_CLASSES, size=(args.batch_size,), device=dist_util.dev()
-            )
+            if not args.use_classwise:
+                classes = th.randint(
+                    low=0, high=10, size=(args.batch_size,), device=dist_util.dev() # 클래스 수 10 중에서 랜덤으로 선택해서 생성하도록 설정
+                )
+            else:
+                classes = th.randint(
+                    low=args.class_num, high=args.class_num+1, size=(args.batch_size,), device=dist_util.dev() # 원하는 클래스만 생성하도록 설정
+                )
             model_kwargs["y"] = classes
+
         sample_fn = (
             diffusion.p_sample_loop if not args.use_ddim else diffusion.ddim_sample_loop
         )
@@ -77,7 +83,10 @@ def main():
         label_arr = label_arr[: args.num_samples]
     if dist.get_rank() == 0:
         shape_str = "x".join([str(x) for x in arr.shape])
-        out_path = os.path.join(logger.get_dir(), f"samples_{shape_str}.npz")
+        if not args.use_classwise:
+            out_path = os.path.join(args.save_path, f"samples_{shape_str}.npz") # 이미지 저장 경로 설정
+        else:
+            out_path = os.path.join(args.save_path, f"samples_{shape_str}_class_{args.class_num}.npz") # 이미지 저장 경로 설정
         logger.log(f"saving to {out_path}")
         if args.class_cond:
             np.savez(out_path, arr, label_arr)
@@ -95,6 +104,9 @@ def create_argparser():
         batch_size=16,
         use_ddim=False,
         model_path="",
+        save_path="", # 이미지 기본 저장 경로
+        use_classwise=False,
+        class_num=-1, # 출력하고 싶은 클래스
     )
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()
