@@ -5,7 +5,7 @@ Train a diffusion model on images.
 import argparse
 
 from improved_diffusion import dist_util, logger
-from improved_diffusion.image_datasets import load_data
+from improved_diffusion.image_datasets import load_data,get_data_len
 from improved_diffusion.resample import create_named_schedule_sampler
 from improved_diffusion.script_util import (
     model_and_diffusion_defaults,
@@ -35,7 +35,13 @@ def main():
         batch_size=args.batch_size,
         image_size=args.image_size,
         class_cond=args.class_cond,
-        deterministic=True  # No shuffle
+    )
+    
+    #데이터 길이 가져오기
+    data_len = get_data_len(
+        data_dir=args.data_dir,
+        image_size=args.image_size,
+        class_cond=args.class_cond,        
     )
 
     logger.log("training...")
@@ -43,6 +49,7 @@ def main():
         model=model,
         diffusion=diffusion,
         data=data,
+        data_len=data_len, # 데이터 길이 입력
         batch_size=args.batch_size,
         microbatch=args.microbatch,
         lr=args.lr,
@@ -50,7 +57,9 @@ def main():
         log_interval=args.log_interval,
         save_interval=args.save_interval,
         resume_checkpoint=args.resume_checkpoint,
+        model_path = args.model_path, # 모델 저장 위치 입력
         use_fp16=args.use_fp16,
+        epoch=100, # Epoch 입력
         fp16_scale_growth=args.fp16_scale_growth,
         schedule_sampler=schedule_sampler,
         weight_decay=args.weight_decay,
@@ -65,12 +74,13 @@ def create_argparser():
         lr=1e-4,
         weight_decay=0.0,
         lr_anneal_steps=0,
-        batch_size=1,
+        batch_size=16,
         microbatch=-1,  # -1 disables microbatches
         ema_rate="0.9999",  # comma-separated list of EMA values
         log_interval=10,
         save_interval=10000,
         resume_checkpoint="",
+        model_path="", # 모델 저장 위치 기본 경로
         use_fp16=False,
         fp16_scale_growth=1e-3,
     )

@@ -33,9 +33,10 @@ class ImbalanceCIFAR10(datasets.CIFAR100):
                  transform=None, target_transform=None, download=True):
         super(ImbalanceCIFAR10, self).__init__(root, train, transform, target_transform, download)
         np.random.seed(rand_number)
-        self.img_num_list = self.get_img_num_per_cls(self.cls_num, imb_type, imb_factor)
-        self.num_per_cls_dict = dict()
-        self.gen_imbalanced_data(self.img_num_list)
+        if train :
+            self.img_num_list = self.get_img_num_per_cls(self.cls_num, imb_type, imb_factor)
+            self.num_per_cls_dict = dict()
+            self.gen_imbalanced_data(self.img_num_list)
 
         self.root = root
 
@@ -177,7 +178,7 @@ if __name__ == "__main__":
             filename = os.path.join(out_dir, f"{CLASSES[label]}_{i:05d}.png")
             image.save(filename)
         
-        print(rf"downloading {split} set done! {"\n"} {len(dataset)} samples {"\n"} Classes : {CLASSES} {"\n"} Num of Classes : {dataset.img_num_list}")
+        #print(rf"downloading {split} set done! {"\n"} {len(dataset)} samples {"\n"} Classes : {CLASSES} {"\n"} Num of Classes : {dataset.img_num_list}")
 
 
     temp_dir = os.path.join(os.getcwd(), "cifar-10-batches-py")

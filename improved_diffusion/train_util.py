@@ -1,6 +1,8 @@
 import copy
 import functools
 import os
+from . import global_var
+from PIL import Image
 
 import blobfile as bf
 import numpy as np
@@ -8,7 +10,10 @@ import torch as th
 import torch.distributed as dist
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
-
+#
+import torchvision.transforms as transforms
+import random
+#
 from . import dist_util, logger
 from .fp16_util import (
     make_master_params,
@@ -20,6 +25,8 @@ from .fp16_util import (
 from .nn import update_ema
 from .resample import LossAwareSampler, UniformSampler
 
+import math
+from tqdm import tqdm
 # For ImageNet experiments, this was a good default value.
 # We found that the lg_loss_scale quickly climbed to
 # 20-21 within the first ~1K steps of training.
@@ -33,6 +40,7 @@ class TrainLoop:
         model,
         diffusion,
         data,
+        data_len, #데이터길이
         batch_size,
         microbatch,
         lr,
@@ -40,7 +48,9 @@ class TrainLoop:
         log_interval,
         save_interval,
         resume_checkpoint,
+        model_path, #모델 저장 위치
         use_fp16=False,
+        epoch=100, #epoch수
         fp16_scale_growth=1e-3,
         schedule_sampler=None,
         weight_decay=0.0,
@@ -49,6 +59,7 @@ class TrainLoop:
         self.model = model
         self.diffusion = diffusion
         self.data = data
+        self.data_len = data_len #데이터길이
         self.batch_size = batch_size
         self.microbatch = microbatch if microbatch > 0 else batch_size
         self.lr = lr
@@ -60,11 +71,15 @@ class TrainLoop:
         self.log_interval = log_interval
         self.save_interval = save_interval
         self.resume_checkpoint = resume_checkpoint
+        self.model_path = model_path # 모델 저장 위치 설정
         self.use_fp16 = use_fp16
         self.fp16_scale_growth = fp16_scale_growth
         self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
+
+        self.epoch = epoch # Epoch 수 저장
+        self.steps_per_epoch = self.data_len//batch_size # Epoch 마다 총 step 수 (데이터 길이 // 배치 크기)
 
         self.step = 0
         self.resume_step = 0
@@ -159,23 +174,20 @@ class TrainLoop:
         self.model.convert_to_fp16()
 
     def run_loop(self):
-        while (
-            not self.lr_anneal_steps
-            or self.step + self.resume_step < self.lr_anneal_steps
-        ):
-            batch, cond = next(self.data)
-            self.run_step(batch, cond)
-            if self.step % self.log_interval == 0:
-                logger.dumpkvs()
-            if self.step % self.save_interval == 0:
-                self.save()
-                # Run for a finite amount of time in integration tests.
-                if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
-                    return
-            self.step += 1
-        # Save the last checkpoint if it wasn't already saved.
-        if (self.step - 1) % self.save_interval != 0:
-            self.save()
+        for epc in range(self.epoch): # 정해진 Epoch 만큼 학습
+            with tqdm(total=self.steps_per_epoch, desc=f"Epoch {epc + 1}/{self.epoch}", unit="step") as pbar: #tqdm으로 진행상황 출력
+                for _ in range(self.steps_per_epoch): # 1 Epoch - 전체 데이터를 배치 단위로 학습
+                    # 배치 단위 학습
+                    batch, cond = next(self.data)
+                    self.run_step(batch, cond)
+
+                    # 10회 step 마다 Loss 진행 상황 logging
+                    if self.step % self.log_interval == 0: 
+                        logger.dumpkvs()
+                    
+                    self.step += 1 # step 추가 (모델 저장 및 로깅에 쓰임)
+                    pbar.update(1) # tqdm 업데이트
+        self.save() # 모든 Epoch을 다 수행했다면 모델을 저장
 
     def run_step(self, batch, cond):
         self.forward_backward(batch, cond)
@@ -184,62 +196,181 @@ class TrainLoop:
         else:
             self.optimize_normal()
         self.log_step()
+    
+    def load_image(self, image_path, resolution):
 
-    #https://github.com/facebookresearch/mixup-cifar10/blob/main/train.py
-    def mixup_data(x, y, use_cuda=True):
-        '''Returns mixed inputs, pairs of targets, and lambda'''
-        lam = 0.9
+        with open(image_path, "rb") as f:
+            pil_image = Image.open(f)
+            pil_image.load()
 
-        batch_size = x.size()[0]
-        if use_cuda:
-            index = th.randperm(batch_size).cuda()
-        else:
-            index = th.randperm(batch_size)
+        # Resize the image while maintaining aspect ratio
+        while min(*pil_image.size) >= 2 * resolution:
+            pil_image = pil_image.resize(
+                tuple(x // 2 for x in pil_image.size), resample=Image.BOX
+            )
 
-        mixed_x = lam * x + (1 - lam) * x[index, :]
-        y_a, y_b = y, y[index]
-        return mixed_x, y_a, y_b, lam
+        # Scale the image to the target resolution
+        scale = resolution / min(*pil_image.size)
+        pil_image = pil_image.resize(
+            tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
+        )
+
+        # Center crop and normalize
+        arr = np.array(pil_image.convert("RGB"))
+        crop_y = (arr.shape[0] - resolution) // 2
+        crop_x = (arr.shape[1] - resolution) // 2
+        arr = arr[crop_y : crop_y + resolution, crop_x : crop_x + resolution]
+        arr = arr.astype(np.float32) / 127.5 - 1
+
+        # Convert to PyTorch Tensor (C, H, W)
+        return th.tensor(np.transpose(arr, [2, 0, 1]), dtype=th.float32)
+    
+    def pad_and_combine_mixup_images(self,mixup_images_list, image_shape=(3, 32, 32)):
+        # 가장 긴 배열의 길이 
+        max_length = max(len(images) for images in mixup_images_list)
+
+        # 배치 크기
+        batch_size = len(mixup_images_list)
+
+        # 패딩된 이미지를 저장할 텐서
+        padded_mixup_images = th.zeros((max_length,batch_size, *image_shape), dtype=th.float32)
+        masks = th.zeros(( max_length,batch_size), dtype=th.float32)
+
+        # 각 mixup_images 배열을 패딩하여 결합
+        for i, images in enumerate(mixup_images_list):
+            num_images = len(images)
+            padded_mixup_images[:num_images, i] = th.stack(images)  # 이미지가 첫 번째 차원에 배치
+            masks[:num_images, i] = 1  # 마스크의 해당 영역을 1로 설정
+
+        return padded_mixup_images, masks , max_length
 
     def forward_backward(self, batch, cond):
+        
+        is_minor = cond["y"][0] in global_var.minor_classes
+        if is_minor: # if minor batch comes
+            #print("Minor batch  has come!!")
+            samples_per_classes = th.tensor(global_var.sample_nums, dtype=th.float32)
+            mixup_images_list = []
+
+            for i in range(batch.shape[0]):
+                minor_image = batch[i].squeeze(0)  # (C, H, W)
+                minor_image_class = cond["y"][i]
+                sample_per_major_classes = samples_per_classes[:len(samples_per_classes) // 2]
+                sample_per_minor_classes = samples_per_classes[len(samples_per_classes) // 2:]
+
+                # 예외 처리를 추가한 how_many_images_to_mix 계산
+                try:
+                    ratio = sample_per_major_classes.min() / samples_per_classes[minor_image_class]
+                    how_many_images_to_mix = min(
+                        5 * math.log(max(ratio, 1)) / math.log(2),  # 로그 입력값 1 이상으로 보장
+                        sample_per_major_classes.min() / sample_per_minor_classes.min(),
+                    )
+                except (ValueError, ZeroDivisionError) as e:
+                    print(f"Error in how_many_images_to_mix calculation: {e}")
+                    how_many_images_to_mix = 1  # 기본값
+
+                how_many_images_to_mix = int(how_many_images_to_mix)
+
+                # Normalize major class samples
+                sample_per_major_classes_normalize = sample_per_major_classes / sample_per_major_classes.sum()
+                pick_images_from_majors = th.round(sample_per_major_classes_normalize * how_many_images_to_mix)
+
+                mixup_images = [minor_image]
+
+                for c, num in enumerate(pick_images_from_majors):
+                    if num < 1:
+                        continue
+                    image_list = global_var.major_class_files[c]
+
+                    random_major_images = random.sample(image_list, int(num))
+
+                    for image_path in random_major_images:
+                        major_image = self.load_image(image_path, 32)  # (C, H, W)
+                        if major_image.shape != minor_image.shape:
+                            print(f"Shape mismatch: major_image {major_image.shape}, minor_image {minor_image.shape}")
+                            continue
+                        mixup_image = 0.9 * minor_image + 0.1 * major_image
+                        mixup_images.append(mixup_image)
+
+                # 리스트를 텐서로 변환
+                # mixup_images = np.stack([img.cpu().numpy() for img in mixup_images], axis=0)
+                # mixup_images = th.tensor(mixup_images, dtype=th.float32)
+                mixup_images_list.append(mixup_images)
+
+            
+            padded_mixup_images, masks , max_length= self.pad_and_combine_mixup_images(mixup_images_list)
+
+        else : # major batch comes
+            max_length = 1
+
+
         zero_grad(self.model_params)
-        for i in range(0, batch.shape[0], self.microbatch):
-            micro = batch[i : i + self.microbatch].to(dist_util.dev()) # dist_util.dev => 현재 사용중인 device로 이동
-            micro_cond = {
-                k: v[i : i + self.microbatch].to(dist_util.dev())
-                for k, v in cond.items()
-            }
-            print("God damn micro cond!!!!!!!!!!:",micro_cond)
-            last_batch = (i + self.microbatch) >= batch.shape[0]
-            t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
+        true_target = None
+        ture_vd = None
+        for batch_idx in range(max_length):
+            if is_minor :
+                batch = padded_mixup_images[batch_idx]
+            for i in range(0, batch.shape[0], self.microbatch):
+                micro = batch[i : i + self.microbatch].to(dist_util.dev()) # dist_util.dev => 현재 사용중인 device로 이동
+                micro_cond = {
+                    k: v[i : i + self.microbatch].to(dist_util.dev())
+                    for k, v in cond.items()
+                }
 
-            compute_losses = functools.partial(
-                self.diffusion.training_losses,
-                self.ddp_model, # model
-                micro, #x_start
-                t, # t
-                model_kwargs=micro_cond, #model_kwargs
-            )
+                last_batch = (i + self.microbatch) >= batch.shape[0]
+                
+                if (is_minor and batch_idx == 0) or not is_minor:
+                    t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
 
-            if last_batch or not self.use_ddp:
-                losses = compute_losses()
-            else:
-                with self.ddp_model.no_sync():
+                #print("time steps :",t)
+
+                if true_target is not None and true_vb is not None :
+                    compute_losses = functools.partial(
+                        self.diffusion.training_losses,
+                        self.ddp_model, # model
+                        micro, #x_start
+                        t, # t
+                        model_kwargs=micro_cond, #model_kwargs
+                        is_minor = is_minor,
+                        save_mean_var = batch_idx == 0,
+                        true_target = true_target,
+                        true_vb = true_vb,
+                    )
+                else :
+                    compute_losses = functools.partial(
+                        self.diffusion.training_losses,
+                        self.ddp_model, # model
+                        micro, #x_start
+                        t, # t
+                        model_kwargs=micro_cond, #model_kwargs
+                        is_minor = is_minor,
+                        save_mean_var = batch_idx == 0,
+                    )
+                
+                if last_batch or not self.use_ddp:
                     losses = compute_losses()
+                    if (is_minor and batch_idx == 0):
+                            #print("What is true mean? :", losses["target"].shape)
+                            true_target = losses["target"]
+                            true_vb = losses["vb"]
+                            losses.pop("target")
+                else:
+                    with self.ddp_model.no_sync():
+                        losses = compute_losses()
 
-            if isinstance(self.schedule_sampler, LossAwareSampler):
-                self.schedule_sampler.update_with_local_losses(
-                    t, losses["loss"].detach()
+                if isinstance(self.schedule_sampler, LossAwareSampler):
+                    self.schedule_sampler.update_with_local_losses(
+                        t, losses["loss"].detach()
+                    )
+                loss = (losses["loss"] * weights).mean()
+                log_loss_dict(
+                    self.diffusion, t, {k: v * weights for k, v in losses.items()}
                 )
-
-            loss = (losses["loss"] * weights).mean()
-            log_loss_dict(
-                self.diffusion, t, {k: v * weights for k, v in losses.items()}
-            )
-            if self.use_fp16:
-                loss_scale = 2 ** self.lg_loss_scale
-                (loss * loss_scale).backward()
-            else:
-                loss.backward()
+                if self.use_fp16:
+                    loss_scale = 2 ** self.lg_loss_scale
+                    (loss * loss_scale).backward()
+                else:
+                    loss.backward(retain_graph=True)
 
     def optimize_fp16(self):
         if any(not th.isfinite(p.grad).all() for p in self.model_params):
@@ -290,10 +421,10 @@ class TrainLoop:
             if dist.get_rank() == 0:
                 logger.log(f"saving model {rate}...")
                 if not rate:
-                    filename = f"model{(self.step+self.resume_step):06d}.pt"
+                    filename = f"model{(self.step+self.resume_step):06d}.pt" # 일반 모델
                 else:
-                    filename = f"ema_{rate}_{(self.step+self.resume_step):06d}.pt"
-                with bf.BlobFile(bf.join(get_blob_logdir(), filename), "wb") as f:
+                    filename = f"ema_{rate}_{(self.step+self.resume_step):06d}.pt" # EMA 모델을 쓰면 조금 더 효율적으로 샘플링 가능
+                with bf.BlobFile(bf.join(self.model_path, filename), "wb") as f: # 모델 저장 위치에 현재 모델 상태 저장 (model_XXXX.pt, ema_0.9999_XXXX.pt) 
                     th.save(state_dict, f)
 
         save_checkpoint(0, self.master_params)
@@ -302,7 +433,7 @@ class TrainLoop:
 
         if dist.get_rank() == 0:
             with bf.BlobFile(
-                bf.join(get_blob_logdir(), f"opt{(self.step+self.resume_step):06d}.pt"),
+                bf.join(self.model_path, f"opt{(self.step+self.resume_step):06d}.pt"), # 모델 저장 위치에 현재 Optimizer 상태 저장
                 "wb",
             ) as f:
                 th.save(self.opt.state_dict(), f)

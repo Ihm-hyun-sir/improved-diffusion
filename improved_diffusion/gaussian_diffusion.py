@@ -640,7 +640,7 @@ class GaussianDiffusion:
                 img = out["sample"]
 
     def _vb_terms_bpd(
-        self, model, x_start, x_t, t, clip_denoised=True, model_kwargs=None
+        self, model, x_start, x_t, t, clip_denoised=True, model_kwargs=None , is_minor = False , save_mean_var = False
     ):
         """
         Get a term for the variational lower-bound.
@@ -655,6 +655,7 @@ class GaussianDiffusion:
         true_mean, _, true_log_variance_clipped = self.q_posterior_mean_variance(
             x_start=x_start, x_t=x_t, t=t
         )
+
         out = self.p_mean_variance(
             model, x_t, t, clip_denoised=clip_denoised, model_kwargs=model_kwargs
         )
@@ -672,9 +673,12 @@ class GaussianDiffusion:
         # At the first timestep return the decoder NLL,
         # otherwise return KL(q(x_{t-1}|x_t,x_0) || p(x_{t-1}|x_t))
         output = th.where((t == 0), decoder_nll, kl)
-        return {"output": output, "pred_xstart": out["pred_xstart"]}
+        if is_minor and save_mean_var :
+            return {"output": output, "pred_xstart": out["pred_xstart"] , "true_mean": true_mean , "true_var":true_log_variance_clipped}
+        else :
+            return {"output": output, "pred_xstart": out["pred_xstart"]}
 
-    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
+    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None, is_minor = False, save_mean_var = False, true_target = None , true_vb = None):
         """
         Compute training losses for a single timestep.
 
@@ -706,7 +710,9 @@ class GaussianDiffusion:
             )["output"]
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
+                
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
+
             model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
 
             if self.model_var_type in [
@@ -738,6 +744,13 @@ class GaussianDiffusion:
                 ModelMeanType.START_X: x_start,
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
+            ##################################################
+            if is_minor and save_mean_var:
+                terms["target"] = target
+            if true_target is not None and true_vb is not None :
+                target = true_target
+                terms["vb"] = true_vb
+            ##################################################
             assert model_output.shape == target.shape == x_start.shape
             terms["mse"] = mean_flat((target - model_output) ** 2)
             if "vb" in terms:

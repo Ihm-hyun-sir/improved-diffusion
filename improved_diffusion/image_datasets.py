@@ -3,10 +3,35 @@ import blobfile as bf
 from mpi4py import MPI
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
-
+from itertools import chain
 from torch.utils.data import Sampler
 import random 
+import torch
+from . import global_var
+#######################################################
+def get_data_len(
+    *, data_dir, image_size, class_cond=False, deterministic=False
+):
+    if not data_dir:
+        raise ValueError("unspecified data directory")
+    all_files = _list_image_files_recursively(data_dir)
+    classes = None
+    if class_cond:
+        # Assume classes are the first part of the filename,
+        # before an underscore.
+        class_names = [bf.basename(path).split("_")[0] for path in all_files]
+        sorted_classes = {x: i for i, x in enumerate(sorted(set(class_names)))}
+        classes = [sorted_classes[x] for x in class_names]
+    dataset = ImageDataset(
+        image_size,
+        all_files,
+        classes=classes,
+        shard=MPI.COMM_WORLD.Get_rank(),
+        num_shards=MPI.COMM_WORLD.Get_size(),
+    )
 
+    return len(dataset)
+#######################################################
 
 class MajorMinorSampler(Sampler):
     def __init__(self, classes, batch_size, major_classes, minor_classes):
@@ -89,14 +114,24 @@ def load_data(
         x: i for i, (x, _) in enumerate(sorted(class_counts.items(), key=lambda item: item[1], reverse=True))
         }
         classes = [sorted_classes[x] for x in class_names]
-
+        class_names = list(sorted_classes.keys())
+        major_class_names = class_names[:len(class_names)//2]
         index_of_classes_sorted = list(sorted_classes.values())
         major_classes = [x for x in index_of_classes_sorted[:len(index_of_classes_sorted)//2]]
         minor_classes = [x for x in index_of_classes_sorted[len(index_of_classes_sorted)//2 :len(index_of_classes_sorted) ]]
-        
-        print("Major classes : ",major_classes)
-        print("minor classes  : ",minor_classes)
+        sample_nums = [x for x in class_counts.values()]
 
+        major_class_files = {class_name: [] for class_name in major_classes}
+
+        for file_path in all_files:
+            class_name = bf.basename(file_path).split("_")[0]  # 파일 이름에서 클래스 추출
+            if class_name in major_class_names:  # 주요 클래스에 해당하는지 확인
+                major_class_files[sorted_classes[class_name]].append(file_path)
+
+        global_var.major_class_files = major_class_files
+        global_var.sample_nums = sample_nums
+        global_var.major_classes = major_classes
+        global_var.minor_classes = minor_classes
 
     dataset = ImageDataset(
         image_size,
@@ -139,6 +174,7 @@ class ImageDataset(Dataset):
         self.resolution = resolution
         self.local_images = image_paths[shard:][::num_shards]
         self.local_classes = None if classes is None else classes[shard:][::num_shards]
+        
 
     def __len__(self):
         return len(self.local_images)
