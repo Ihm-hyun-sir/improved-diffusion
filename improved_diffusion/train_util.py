@@ -21,7 +21,9 @@ from .nn import update_ema
 from .resample import LossAwareSampler, UniformSampler
 
 from tqdm import tqdm # tqdm import
-
+###
+import random
+###
 # For ImageNet experiments, this was a good default value.
 # We found that the lg_loss_scale quickly climbed to
 # 20-21 within the first ~1K steps of training.
@@ -192,14 +194,66 @@ class TrainLoop:
             self.optimize_normal()
         self.log_step()
 
+    def mixup_samples(self, data, labels):
+        """
+        Major와 Minor 클래스를 분리한 후, 서로 Mixup.
+        Args:
+            data: Tensor, 배치 내 데이터 (N, C, H, W).
+            labels: Tensor, 배치 내 레이블 (N,).
+            alpha: Mixup 비율을 결정하는 파라미터.
+        Returns:
+            Mixed data와 Mixed labels.
+        """
+        # Major와 Minor 분리
+        major_mask = (labels < 5)
+        minor_mask = (labels >= 5)
+
+        major_indices = np.nonzero(major_mask)
+        minor_indices = np.nonzero(minor_mask)
+
+        # Mixup 결과 저장용 리스트
+        mixed_data = []
+        mixed_labels = []
+
+        if len(major_indices) > 0 and len(minor_indices) > 0:
+            # Major -> Minor 
+            for idx in range(len(data)):
+                if major_mask[idx] :
+                    minor_idx = random.choice(minor_indices)
+                    mixed_sample = 0.1 * data[idx] + 0.9 * data[minor_idx]
+                    mixed_data.append(mixed_sample.squeeze(0))
+                    mixed_labels.append((labels[minor_idx] , minor_idx))
+                else : 
+                    major_idx = random.choice(major_indices)
+                    mixed_sample = 0.9 * data[idx] + 0.1 * data[major_idx]
+                    mixed_data.append(mixed_sample.squeeze(0))
+                    mixed_labels.append((labels[idx] ,idx))
+
+            # Mixed data와 labels 반환
+            mixed_data = th.stack(mixed_data)
+            mixed_labels = th.tensor(mixed_labels)
+            return mixed_data, mixed_labels , True
+        
+        else:
+            return data, labels , False
+
     def forward_backward(self, batch, cond):
         zero_grad(self.model_params)
+        ####
+        mixed_data, mixed_labels , mixup_done = self.mixup_samples(batch, cond["y"])
+        ####
         for i in range(0, batch.shape[0], self.microbatch):
             micro = batch[i : i + self.microbatch].to(dist_util.dev())
             micro_cond = {
                 k: v[i : i + self.microbatch].to(dist_util.dev())
                 for k, v in cond.items()
             }
+            ####
+            if mixup_done :
+                mixed_micro = mixed_data[i : i + self.microbatch].to(dist_util.dev())
+                mixed_mirco_cond = { "y" : th.tensor([ int( mixed_labels[idx][0] ) for idx in range(i, min(i+self.microbatch,len(mixed_labels)))]) }
+                mixed_minor_idx = th.tensor([ int( mixed_labels[idx][1] ) for idx in range(i, min(i+self.microbatch,len(mixed_labels)))]).to(dist_util.dev())
+            ####
 
             last_batch = (i + self.microbatch) >= batch.shape[0]
             t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
@@ -211,27 +265,62 @@ class TrainLoop:
                 t,
                 model_kwargs=micro_cond,
             )
+            # if last_batch or not self.use_ddp:
+            #     print("last_batch")
+            #     losses = compute_losses()
+            # else:
+            #     print("Nooo")
+            #     with self.ddp_model.no_sync():
+            #         losses = compute_losses()
 
-            if last_batch or not self.use_ddp:
-                losses = compute_losses()
-            else:
-                with self.ddp_model.no_sync():
-                    losses = compute_losses()
-
-            if isinstance(self.schedule_sampler, LossAwareSampler):
-                self.schedule_sampler.update_with_local_losses(
-                    t, losses["loss"].detach()
-                )
-
+            losses , gt_target = compute_losses()
             loss = (losses["loss"] * weights).mean()
+            total_loss = loss
+
+            if mixup_done :
+                vb = losses['vb']
+
+                major_mask = (micro_cond["y"] < 5)
+                major_indices = major_mask.nonzero(as_tuple=True)[0]
+                selected_minor_indices = mixed_minor_idx[major_indices]
+
+                # print(micro_cond)
+                # print(mixed_mirco_cond)
+                # print(mixed_minor_idx)
+                # print(major_indices)
+                # print(selected_minor_indices)
+                gt_target[major_indices] = gt_target[selected_minor_indices]
+                vb[major_indices] = vb[selected_minor_indices]
+                
+                
+                compute_mixup_losses = functools.partial(
+                    self.diffusion.training_losses,
+                    self.ddp_model,
+                    mixed_micro,
+                    t,
+                    model_kwargs=mixed_mirco_cond,
+                    target = gt_target,
+                    vb = vb
+                )
+                mixup_losses , _  = compute_mixup_losses()
+
+                mixup_loss = (mixup_losses["loss"] * weights).mean()
+                total_loss += mixup_loss
+
+            # if isinstance(self.schedule_sampler, LossAwareSampler): 사용안함
+            #     self.schedule_sampler.update_with_local_losses(
+            #         t, losses["loss"].detach()
+            #     )
+
             log_loss_dict(
                 self.diffusion, t, {k: v * weights for k, v in losses.items()}
             )
+
             if self.use_fp16:
                 loss_scale = 2 ** self.lg_loss_scale
-                (loss * loss_scale).backward()
+                (total_loss * loss_scale).backward()
             else:
-                loss.backward()
+                total_loss.backward()
 
     def optimize_fp16(self):
         if any(not th.isfinite(p.grad).all() for p in self.model_params):

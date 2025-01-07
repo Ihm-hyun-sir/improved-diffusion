@@ -3,8 +3,10 @@ import blobfile as bf
 from mpi4py import MPI
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
-
+from torch.utils.data.sampler import WeightedRandomSampler
+import torch
 #######################################################
+from collections import Counter
 def get_data_len(
     *, data_dir, image_size, class_cond=False, deterministic=False
 ):
@@ -27,29 +29,42 @@ def get_data_len(
     )
 
     return len(dataset)
-#######################################################
 
-def load_data(
-    *, data_dir, batch_size, image_size, class_cond=False, deterministic=False
+
+def calculate_class_weights(class_counts):
+    """
+    클래스별 샘플 개수를 받아 가중치를 계산합니다.
+    """
+    total_count = sum(class_counts.values())
+    weights = {cls: total_count / count for cls, count in class_counts.items()}
+    return weights
+
+def get_balanced_sampler(classes, class_weights):
+    """
+    클래스 가중치를 사용해 WeightedRandomSampler를 생성합니다.
+    """
+    sample_weights = [class_weights[cls] for cls in classes]
+    sampler = WeightedRandomSampler(
+        weights=sample_weights, 
+        num_samples=len(sample_weights), 
+        replacement=False
+    )
+
+    # sampled_indices = list(sampler)
+    # sampled_classes = [classes[idx] for idx in sampled_indices]
+
+    # # 샘플링 결과 확인
+    # sampled_counts = Counter(sampled_classes)
+
+    # print("Sampled Class Counts:", sampled_counts)
+    return sampler
+
+def load_data( #balanced
+    *, data_dir, batch_size, image_size, class_cond=True, deterministic=False
 ):
-    """
-    For a dataset, create a generator over (images, kwargs) pairs.
-
-    Each images is an NCHW float tensor, and the kwargs dict contains zero or
-    more keys, each of which map to a batched Tensor of their own.
-    The kwargs dict can be used for class labels, in which case the key is "y"
-    and the values are integer tensors of class labels.
-
-    :param data_dir: a dataset directory.
-    :param batch_size: the batch size of each returned pair.
-    :param image_size: the size to which images are resized.
-    :param class_cond: if True, include a "y" key in returned dicts for class
-                       label. If classes are not available and this is true, an
-                       exception will be raised.
-    :param deterministic: if True, yield results in a deterministic order.
-    """
     if not data_dir:
         raise ValueError("unspecified data directory")
+    
     all_files = _list_image_files_recursively(data_dir)
     classes = None
     if class_cond:
@@ -58,6 +73,15 @@ def load_data(
         class_names = [bf.basename(path).split("_")[0] for path in all_files]
         sorted_classes = {x: i for i, x in enumerate(sorted(set(class_names)))}
         classes = [sorted_classes[x] for x in class_names]
+    
+    # 클래스별 데이터 수 세기
+    class_counts = {cls: 0 for cls in sorted_classes.values()}
+    for cls in classes:
+        class_counts[cls] += 1
+    
+    # 클래스 가중치 계산
+    class_weights = calculate_class_weights(class_counts)
+    
     dataset = ImageDataset(
         image_size,
         all_files,
@@ -66,17 +90,64 @@ def load_data(
         num_shards=MPI.COMM_WORLD.Get_size(),
     )
     
-    if deterministic:
-        loader = DataLoader(
-            dataset, batch_size=batch_size, shuffle=False, num_workers=1, drop_last=True
-        )
-    else:
-        loader = DataLoader(
-            dataset, batch_size=batch_size, shuffle=True, num_workers=1, drop_last=True
-        )
+    sampler = get_balanced_sampler(classes, class_weights)
+    
+    loader = DataLoader(
+        dataset, batch_size=batch_size, sampler=sampler, num_workers=1, drop_last=True
+    )
     
     while True:
         yield from loader
+######################################################
+
+# def load_data(
+#     *, data_dir, batch_size, image_size, class_cond=False, deterministic=False
+# ):
+#     """
+#     For a dataset, create a generator over (images, kwargs) pairs.
+
+#     Each images is an NCHW float tensor, and the kwargs dict contains zero or
+#     more keys, each of which map to a batched Tensor of their own.
+#     The kwargs dict can be used for class labels, in which case the key is "y"
+#     and the values are integer tensors of class labels.
+
+#     :param data_dir: a dataset directory.
+#     :param batch_size: the batch size of each returned pair.
+#     :param image_size: the size to which images are resized.
+#     :param class_cond: if True, include a "y" key in returned dicts for class
+#                        label. If classes are not available and this is true, an
+#                        exception will be raised.
+#     :param deterministic: if True, yield results in a deterministic order.
+#     """
+#     if not data_dir:
+#         raise ValueError("unspecified data directory")
+#     all_files = _list_image_files_recursively(data_dir)
+#     classes = None
+#     if class_cond:
+#         # Assume classes are the first part of the filename,
+#         # before an underscore.
+#         class_names = [bf.basename(path).split("_")[0] for path in all_files]
+#         sorted_classes = {x: i for i, x in enumerate(sorted(set(class_names)))}
+#         classes = [sorted_classes[x] for x in class_names]
+#     dataset = ImageDataset(
+#         image_size,
+#         all_files,
+#         classes=classes,
+#         shard=MPI.COMM_WORLD.Get_rank(),
+#         num_shards=MPI.COMM_WORLD.Get_size(),
+#     )
+    
+#     if deterministic:
+#         loader = DataLoader(
+#             dataset, batch_size=batch_size, shuffle=False, num_workers=1, drop_last=True
+#         )
+#     else:
+#         loader = DataLoader(
+#             dataset, batch_size=batch_size, shuffle=True, num_workers=1, drop_last=True
+#         )
+    
+#     while True:
+#         yield from loader
 
 
 def _list_image_files_recursively(data_dir):

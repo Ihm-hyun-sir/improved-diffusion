@@ -37,7 +37,6 @@ class ImbalanceCIFAR10(datasets.CIFAR100):
             self.img_num_list = self.get_img_num_per_cls(self.cls_num, imb_type, imb_factor)
             self.num_per_cls_dict = dict()
             self.gen_imbalanced_data(self.img_num_list)
-
         self.root = root
 
     def get_img_num_per_cls(self, cls_num, imb_type, imb_factor):
